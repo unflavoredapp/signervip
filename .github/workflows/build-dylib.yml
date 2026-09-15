@@ -1,0 +1,146 @@
+name: Build FLEX++ Dylib
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      source_dir:
+        description: 'Folder containing the FLEX source (.m/.c files)'
+        required: false
+        default: '.'
+      out_name:
+        description: 'Output dylib name'
+        required: false
+        default: 'AVX512'
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode
+        run: xcodebuild -version
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Locate source dir
+        id: src
+        run: |
+          DIR="${{ github.event.inputs.source_dir || '.' }}"
+          if [ ! -d "$DIR" ]; then
+            echo "::error::Source dir '$DIR' not found. Repo top-level:"
+            ls -la
+            exit 1
+          fi
+          COUNT=$(find "$DIR" \( -name '*.m' -o -name '*.mm' -o -name '*.c' \) | wc -l | tr -d ' ')
+          echo "Found $COUNT source files in $DIR"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::No .m/.mm/.c files under $DIR"
+            exit 1
+          fi
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Build dylib (clang + ldid)
+        env:
+          SRC: ${{ steps.src.outputs.dir }}
+          OUT: ${{ github.event.inputs.out_name || 'AVX512' }}
+        run: |
+          set -euo pipefail
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          CLANG=$(xcrun --sdk iphoneos -f clang)
+          mkdir -p packages build_slices
+
+          # Gather every ObjC/ObjC++/C source, excluding mac junk (Bash 3.2 safe).
+          # Gather sources, de-duplicating by BASENAME so a file that exists
+          # in two repo locations can't double-compile (duplicate-symbol errors).
+          SOURCES=()
+          SEEN_BASES=" "
+          while IFS= read -r f; do
+            base=$(basename "$f")
+            case "$SEEN_BASES" in
+              *" $base "*)
+                echo "::warning::Skipping duplicate source $f (already have $base)"
+                ;;
+              *)
+                SOURCES+=("$f")
+                SEEN_BASES="$SEEN_BASES$base "
+                ;;
+            esac
+          done < <(find "$SRC" \
+            \( -name '*.m' -o -name '*.mm' -o -name '*.c' \) \
+            -not -path '*/__MACOSX/*' -not -path '*/.git/*' | sort)
+          echo "Compiling ${#SOURCES[@]} files..."
+
+          COMMON_FLAGS=(
+            -isysroot "$SDK"
+            -miphoneos-version-min=14.0
+            -dynamiclib
+            -fobjc-arc
+            -DCAPSTONE_HAS_ARM -DCAPSTONE_HAS_ARM64 -DCAPSTONE_HAS_AARCH64 -DCAPSTONE_USE_SYS_DYN_MEM
+            -I"$SRC" -I"$SRC/x" -I"$SRC/x/capstone" -I"$SRC/x/capstone/include"
+            -framework UIKit -framework Foundation -framework CoreGraphics
+            -framework UserNotifications -framework SafariServices
+            -framework SceneKit -framework WebKit -framework QuartzCore
+            -framework ImageIO -framework Photos -framework QuickLook
+            -framework Security -framework AVFoundation -framework CoreMedia
+            -framework LocalAuthentication -framework CFNetwork
+            -lz -lsqlite3 -lc++ -lc++abi
+            -Wl,-segalign,4000
+            -install_name "@rpath/${OUT}.dylib"
+            -w
+          )
+
+          # Build each arch as its OWN single-arch dylib. Building both arches in
+          # one clang invocation is what triggers the confusing arch-specific
+          # linker errors; per-arch builds isolate any real per-arch problem and
+          # let a good arch still succeed.
+          BUILT=()
+          for ARCH in arm64 arm64e; do
+            echo "=== Building $ARCH ==="
+            if "$CLANG" -arch "$ARCH" "${COMMON_FLAGS[@]}" \
+                 -o "build_slices/${OUT}-${ARCH}.dylib" "${SOURCES[@]}"; then
+              echo "$ARCH OK"
+              BUILT+=("build_slices/${OUT}-${ARCH}.dylib")
+            else
+              echo "::warning::$ARCH failed to link — continuing without it"
+            fi
+          done
+
+          if [ "${#BUILT[@]}" -eq 0 ]; then
+            echo "::error::No architecture linked successfully"
+            exit 1
+          fi
+
+          # Combine whatever arches built into one fat dylib.
+          if [ "${#BUILT[@]}" -eq 1 ]; then
+            cp "${BUILT[0]}" "packages/${OUT}.dylib"
+          else
+            lipo -create "${BUILT[@]}" -output "packages/${OUT}.dylib"
+          fi
+
+          echo "Fakesigning..."
+          ldid -S "packages/${OUT}.dylib"
+          echo "Built:"
+          file "packages/${OUT}.dylib"
+          lipo -info "packages/${OUT}.dylib" || true
+          ls -lh "packages/${OUT}.dylib"
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: AVX512-dylib-${{ github.sha }}
+          path: packages/*.dylib
+          retention-days: 30
+
+      - name: Release on tag
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: packages/*.dylib
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
