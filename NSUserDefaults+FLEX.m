@@ -61,7 +61,7 @@ NSString * const kAVX512DefaultsRegisterJSONExplorerKey = @"net.mrzefv.avx512.vi
     return 100;
 }
 
-- (void)setFlex_toolbarTopMargin:(double)margin {
+- (void)setAvx512_toolbarTopMargin:(double)margin {
     [self setDouble:margin forKey:kAVX512DefaultsToolbarTopMarginKey];
 }
 
